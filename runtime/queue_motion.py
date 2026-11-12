@@ -24,7 +24,10 @@ try:settings=json.loads((p/'settings.json').read_text())
 except (OSError,ValueError):settings={}
 u=uuid.uuid4().hex;job={'id':u,'created':event_at,'camera':1,'source_generation':st['generation'],'scene':scene,'requested_duration':int(settings.get('duration',30)),'pre_roll':float(settings.get('pre_roll',3))}
 if test:job['test']=True
-t=p/(u+'.tmp');t.write_text(json.dumps(job));os.chmod(t,0o600);t.rename(p/(u+'.json'))
+t=p/(u+'.tmp')
+with open(t,'w') as out:
+ os.chmod(t,0o600);json.dump(job,out);out.flush();os.fsync(out.fileno())
+t.rename(p/(u+'.json'))
 fd=os.open(p,os.O_RDONLY|os.O_DIRECTORY)
 try:os.fsync(fd)
 finally:os.close(fd)

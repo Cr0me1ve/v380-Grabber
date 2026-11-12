@@ -145,7 +145,7 @@ class DurableMotionQueueTests(unittest.TestCase):
                     return result
 
                 with patch.object(nvr_worker, "api", side_effect=send_video):
-                    for expected_error in (RuntimeError, KeyError):
+                    for expected_error in (RuntimeError, RuntimeError):
                         with self.subTest(error=expected_error.__name__), self.assertRaises(expected_error):
                             nvr_worker.process(job_path, "send")
                         state = json.loads(job_path.read_text())

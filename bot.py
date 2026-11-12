@@ -77,6 +77,11 @@ def atomic_write(path: Path, content: bytes, mode: int = 0o600) -> None:
             os.fsync(handle.fileno())
         os.replace(temporary, path)
         os.chmod(path, mode)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
     except BaseException:
         try:
             temporary.unlink()

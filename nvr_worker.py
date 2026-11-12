@@ -29,9 +29,11 @@ def safe_json(p,default):
   d=json.loads(p.read_text());return d if isinstance(d,type(default)) else default
  except (OSError,ValueError):return default
 def api(method,fields,video=None,photo=None):
- if video:return RUNTIME.api.send_video(fields['chat_id'],video,fields.get('caption',''))
- if photo:return RUNTIME.api.send_photo(fields['chat_id'],photo.read_bytes(),fields.get('caption',''))
- return RUNTIME.api._json_call(method,fields)
+ if video:result=RUNTIME.api.send_video(fields['chat_id'],video,fields.get('caption',''))
+ elif photo:result=RUNTIME.api.send_photo(fields['chat_id'],photo.read_bytes(),fields.get('caption',''))
+ else:result=RUNTIME.api._json_call(method,fields)
+ if method.startswith('send') and (not isinstance(result,dict) or type(result.get('message_id')) is not int or result['message_id']<=0):raise RuntimeError('Telegram did not acknowledge delivery')
+ return result
 
 def record(job,video):
  completed=(SPOOL/(job['id']+'.complete')).exists() and video.exists()
@@ -122,6 +124,7 @@ def process(p,stage):
  if job.get('recovered'):caption+='\nRecovered from archive: '+str(round(job['duration'],1))+' seconds, muted'
  else:caption+='\n'+str(round(job['duration'],1))+' seconds, muted'
  r=api('sendVideo',{'chat_id':C['chat_id'],'caption':caption,'duration':round(job['duration']),'width':640,'height':360,'supports_streaming':'true'},video)
+ if not isinstance(r,dict) or type(r.get('message_id')) is not int or r['message_id']<=0:raise RuntimeError('Telegram did not acknowledge the video')
  job.update(done=True,sent_at=time.time(),message_id=r['message_id']);save(p,job);log('Delivered motion clip '+job['id'])
 def clean():
  for p in SPOOL.glob('*.json'):
