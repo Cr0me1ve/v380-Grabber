@@ -55,6 +55,13 @@ def initialize():
    target=DATA/'motioneye'/name;atomic(target,text.encode())
    if os.geteuid()==0:os.chown(target,1000,1000)
   atomic(DATA/'web.json',json.dumps({'username':'admin','password':password}).encode())
+ # Upgrade the previous on-disk event hook without changing web credentials or media.
+ camera=DATA/'motioneye/camera-1.conf'
+ if camera.exists():
+  before=camera.read_text();after=before.replace('/etc/motioneye/queue-telegram.py','/helpers/queue_motion.py')
+  if after!=before:
+   atomic(camera,after.encode())
+   if os.geteuid()==0:os.chown(camera,1000,1000)
  save_settings(settings)
  write_runtime_settings(settings)
  return settings
