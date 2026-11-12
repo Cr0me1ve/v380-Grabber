@@ -1,0 +1,16 @@
+{
+  "token": "<ACCOUNT_TOKEN_64_HEX_CHARACTERS>",
+  "device_id": "<YOUR_DEVICE_ID_AS_AN_INTEGER>",
+  "device_public_key": "<BASE64_RAW_32_BYTE_DEVICE_PUBLIC_KEY>",
+  "signature_suffix": "<SDK_SIGNATURE_SUFFIX_FROM_YOUR_AUTHORIZED_BOOTSTRAP>",
+  "secret_ip": "<REGIONAL_CONTROLLER_IP_FROM_YOUR_AUTHORIZED_BOOTSTRAP>",
+  "relays": [
+    {
+      "ip": "<REGIONAL_RELAY_IP_FROM_YOUR_AUTHORIZED_BOOTSTRAP>",
+      "tp": {
+        "call_port": 80,
+        "trans_port": 32100
+      }
+    }
+  ]
+}

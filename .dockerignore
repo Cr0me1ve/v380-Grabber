@@ -1,0 +1,10 @@
+**
+!Dockerfile
+!requirements.txt
+!bot.py
+!auth_backend.py
+!account_auth.py
+!interop_constants.py
+!direct_client.py
+!stream_service.py
+!motion_recorder.py

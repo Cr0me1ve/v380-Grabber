@@ -1,0 +1,39 @@
+services:
+  app:
+    build: .
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 40s
+    user: "${PUID:-1000}:${PGID:-1000}"
+    environment:
+      DATA_DIR: /data
+      TELEGRAM_TOKEN_FILE: /run/secrets/telegram_bot_token
+    volumes:
+      - ./data:/data
+    secrets:
+      - telegram_bot_token
+    ports:
+      - target: 8081
+        published: "8081"
+        host_ip: 127.0.0.1
+        protocol: tcp
+      - target: 8082
+        published: "8082"
+        host_ip: 127.0.0.1
+        protocol: tcp
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "3m"
+        max-file: "2"
+
+secrets:
+  telegram_bot_token:
+    file: ./secrets/telegram_bot_token
