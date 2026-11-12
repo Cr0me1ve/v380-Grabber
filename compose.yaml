@@ -1,39 +1,101 @@
+name: v380-grabber
+x-runtime: &runtime
+  image: v380-grabber-runtime:${V380_REVISION:-local}
+  build:
+    context: .
+    args:
+      V380_REVISION: ${V380_REVISION:-local}
+  restart: unless-stopped
+  init: true
+  user: '1000:1000'
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  environment:
+    PYTHONDONTWRITEBYTECODE: '1'
+    PYTHONUNBUFFERED: '1'
+  logging:
+    driver: json-file
+    options: {max-size: 3m, max-file: '2'}
 services:
-  app:
-    build: .
+  receiver:
+    <<: *runtime
+    entrypoint: [python3, /app/stream_service.py]
+    command: [--credentials, /run/secrets/camera.json, --port, '8081']
+    volumes:
+      - ${V380_DATA_DIR:-./data}/cameras/camera-1.json:/run/secrets/camera.json:ro
+    networks: [camera]
+    mem_limit: 192m
+    cpus: 0.7
+    pids_limit: 64
+    tmpfs: [/tmp:size=16m,mode=1777]
+    healthcheck:
+      test: [CMD, python3, -c, 'import json,urllib.request;assert json.load(urllib.request.urlopen("http://127.0.0.1:8081/health.json",timeout=2))["healthy"]']
+      interval: 15s
+      timeout: 4s
+      retries: 3
+      start_period: 30s
+  selector:
+    <<: *runtime
+    entrypoint: [python3, /app/runtime/source_selector.py]
+    command: []
+    volumes:
+      - ${V380_DATA_DIR:-./data}/control:/config:ro
+    networks:
+      camera:
+        aliases: [v380-source]
+    ports: ['127.0.0.1:8081:8081']
+    mem_limit: 96m
+    cpus: 0.5
+    pids_limit: 64
+    tmpfs: [/tmp:size=8m,mode=1777]
+    healthcheck:
+      test: [CMD, python3, -c, 'import json,urllib.request;assert json.load(urllib.request.urlopen("http://127.0.0.1:8081/health.json",timeout=2))["healthy"]']
+      interval: 15s
+      timeout: 4s
+      retries: 3
+      start_period: 45s
+  motioneye:
+    image: v380-grabber-motioneye:${V380_REVISION:-local}
+    build:
+      context: .
+      dockerfile: Dockerfile.motioneye
+      args:
+        V380_REVISION: ${V380_REVISION:-local}
     restart: unless-stopped
     init: true
-    stop_grace_period: 40s
-    user: "${PUID:-1000}:${PGID:-1000}"
-    environment:
-      DATA_DIR: /data
-      TELEGRAM_TOKEN_FILE: /run/secrets/telegram_bot_token
-    volumes:
-      - ./data:/data
-    secrets:
-      - telegram_bot_token
-    ports:
-      - target: 8081
-        published: "8081"
-        host_ip: 127.0.0.1
-        protocol: tcp
-      - target: 8082
-        published: "8082"
-        host_ip: 127.0.0.1
-        protocol: tcp
     read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 512m
+    cpus: 1.0
+    pids_limit: 128
+    shm_size: 128m
+    environment:
+      TZ: ${TZ:-UTC}
+      PYTHONDONTWRITEBYTECODE: '1'
+      V380_ARCHIVE_SUBDIR: ${V380_ARCHIVE_SUBDIR:-camera}
+      V380_CLOCK_TEMPLATE: /etc/motioneye/clock-template.json
     tmpfs:
-      - /tmp:size=16m
-    cap_drop:
-      - ALL
-    security_opt:
-      - no-new-privileges:true
+      - /tmp:size=128m,uid=1000,gid=1000,mode=1770
+      - /run/motioneye:size=8m,uid=1000,gid=1000,mode=0700
+    volumes:
+      - ${V380_DATA_DIR:-./data}/motioneye:/etc/motioneye
+      - ${V380_DATA_DIR:-./data}/recordings:/var/lib/motioneye
+      - ${V380_DATA_DIR:-./data}/logs:/var/log/motioneye
+      - ./runtime:/helpers:ro
+    networks:
+      camera:
+      proxy:
+        aliases: [v380-motioneye]
+    ports: ['127.0.0.1:8765:8765']
     logging:
       driver: json-file
-      options:
-        max-size: "3m"
-        max-file: "2"
-
-secrets:
-  telegram_bot_token:
-    file: ./secrets/telegram_bot_token
+      options: {max-size: 5m, max-file: '2'}
+networks:
+  camera:
+    name: v380-camera
+    external: true
+  proxy:
+    name: ${PROXY_NETWORK:-v380-proxy}
+    external: true

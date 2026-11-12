@@ -1,0 +1,18 @@
+# @enabled on
+# @admin_username admin
+# @admin_password {{admin_password}}
+# @normal_username user
+# @normal_password {{normal_password}}
+# @lang en
+# @relay_secret {{relay_secret}}
+# @client_secret {{client_secret}}
+
+
+setup_mode off
+webcontrol_port 7999
+webcontrol_localhost on
+webcontrol_interface 1
+webcontrol_parms 2
+
+
+camera camera-1.conf

@@ -12,7 +12,7 @@ from unittest.mock import patch
 from urllib.error import URLError
 
 from auth_backend import AuthorizationBackend, BootstrapValidationError, validate_bootstrap
-from bot import BotError, ClipDelivery, HealthNotifier, RecordingManager, StateStore, TelegramAPI, V380Bot
+from bot import BotError, StateStore, TelegramAPI, V380Bot
 
 
 def valid_bootstrap() -> dict:
@@ -38,7 +38,6 @@ class FakeAPI:
         self.deleted: list[tuple[int, int]] = []
         self.documents: dict[str, bytes] = {}
         self.photos: list[tuple[int, bytes, str]] = []
-        self.video_error = False
 
     def send_message(self, chat_id: int, text: str, menu: bool = False, reply_markup=None):
         self.messages.append((chat_id, text))
@@ -46,11 +45,6 @@ class FakeAPI:
     def send_photo(self, chat_id: int, image: bytes, caption: str):
         self.photos.append((chat_id, image, caption))
         return {"message_id": 900}
-
-    def send_video(self, chat_id: int, path: str, caption: str):
-        if self.video_error:
-            raise BotError("synthetic send failure")
-        return {"message_id": 901}
 
     def delete_message(self, chat_id: int, message_id: int):
         self.deleted.append((chat_id, message_id))
@@ -84,32 +78,41 @@ class FakeManager:
         return self.health_values.get(slot, {"process": "running", "healthy": True, "fps": 15.0})
 
 
-class FakeRecorder:
-    def __init__(self, source_url, directory, slot, settings_callable):
-        self.source_url = source_url
-        self.directory = Path(directory)
-        self.slot = slot
-        self.settings_callable = settings_callable
-        self.started = False
-        self.stopped = False
-        self.acked: list[str] = []
-        self.queued: list[dict] = []
+class FakeRuntime:
+    def __init__(self):
+        from nvr_config import DEFAULTS
 
-    def start(self):
-        self.started = True
+        self.values = dict(DEFAULTS)
+        self.changes: list[tuple[str, object]] = []
+        self.web_chats: list[int] = []
+        self.web_passwords: list[str] = []
 
-    def stop(self):
-        self.stopped = True
+    def settings(self):
+        return dict(self.values)
 
-    def status(self):
-        return {"recording": False, "source_healthy": True, "queued": len(self.queued)} | self.settings_callable()
+    def set_setting(self, name, value):
+        self.changes.append((name, value))
+        self.values[name] = value
+        return True
 
-    def pending(self):
-        return list(self.queued)
+    def web(self, chat_id):
+        self.web_chats.append(chat_id)
 
-    def ack(self, clip_id):
-        self.acked.append(clip_id)
-        self.queued = [item for item in self.queued if item["id"] != clip_id]
+    def web_password(self, password):
+        if not 12 <= len(password) <= 128:
+            raise ValueError("Use a web password containing 12 to 128 characters")
+        self.web_passwords.append(password)
+
+
+class FakeRecordingSettings:
+    def __init__(self):
+        self.values = {"enabled": True, "sensitivity": "medium", "retention_days": 7}
+        self.changes: list[tuple[int, str, object]] = []
+
+    def set_setting(self, slot, name, value):
+        self.changes.append((slot, name, value))
+        self.values[name] = value
+        return True
 
 
 class FakeAuth(AuthorizationBackend):
@@ -326,58 +329,81 @@ class PairingAndBotTests(unittest.TestCase):
         self.assertEqual(self.manager.restarted, [1])
         self.assertEqual(self.store.cameras[0]["recording"], {"enabled": False})
 
-    def test_recording_settings_are_saved_and_validated(self):
-        self.store.state["cameras"] = [{"slot": 1, "name": "Camera 1", "recording": {"enabled": False}}]
-        self.store.save()
-        recording = RecordingManager(self.store, recorder_factory=FakeRecorder)
-        bot = V380Bot(self.store, self.api, self.manager, recordings=recording)
+    def test_runtime_settings_commands_validate_and_route(self):
+        import nvr_config
 
-        bot._handle_text(100, "/recording on")
-        bot._handle_text(100, "/sensitivity high")
-        bot._handle_text(100, "/retention 14")
+        runtime = FakeRuntime()
+        self.manager.runtime = runtime
+        bot = V380Bot(self.store, self.api, self.manager)
+        accepted = [
+            ("/duration 120", "duration", 120),
+            ("/receivers 4", "receivers", 4),
+            ("/pre_roll 0", "pre_roll", 0),
+            ("/storage_gb 1000", "storage_gb", 1000),
+            ("/reserve_gb 0.5", "reserve_gb", 0.5),
+            ("/notifications off", "notifications", False),
+            ("/outage_alerts on", "outage_alerts", True),
+        ]
+        for command, key, expected in accepted:
+            with self.subTest(command=command):
+                bot._handle_text(100, command)
+                self.assertEqual(runtime.values[key], expected)
+                self.assertEqual(runtime.changes[-1], (key, expected))
 
-        settings = recording.settings(1)
-        self.assertEqual(settings, {"enabled": True, "sensitivity": "high", "retention_days": 14})
-        self.assertTrue(recording.status(1)["source_healthy"])
+        changes_before_invalid = len(runtime.changes)
+        for command in (
+            "/duration 4",
+            "/duration 121",
+            "/receivers 0",
+            "/receivers 5",
+            "/pre_roll 11",
+            "/storage_gb 0",
+            "/reserve_gb 100.5",
+            "/notifications maybe",
+            "/outage_alerts maybe",
+        ):
+            with self.subTest(invalid_command=command):
+                bot._handle_text(100, command)
+        self.assertEqual(len(runtime.changes), changes_before_invalid)
 
-    def test_clip_queue_ack_happens_only_after_sendvideo_success(self):
-        code = self.store.issue_claim()
-        self.store.claim_owner(code, 100, 100)
-        recording = RecordingManager(self.store, recorder_factory=FakeRecorder)
-        recorder = FakeRecorder("local", Path(self.temp.name) / "recordings", 1, lambda: {})
-        recorder.queued = [{"id": "a" * 32, "slot": 1, "created_at": 1_800_000_000, "duration": 30, "path": "/data/clip.mp4"}]
-        recording._recorders[1] = recorder
-        delivery = ClipDelivery(self.api, self.store, recording)
+        self.assertEqual(nvr_config.validate_setting("duration", "5"), 5)
+        self.assertEqual(nvr_config.validate_setting("receivers", "1"), 1)
+        self.assertEqual(nvr_config.validate_setting("pre_roll", "10"), 10)
 
-        self.api.video_error = True
-        delivery.deliver_once(now=100)
-        self.assertEqual(recorder.acked, [])
+    def test_settings_summary_and_web_commands_route_to_runtime(self):
+        runtime = FakeRuntime()
+        self.manager.runtime = runtime
+        bot = V380Bot(self.store, self.api, self.manager)
 
-        self.api.video_error = False
-        delivery.deliver_once(now=131)
-        self.assertEqual(recorder.acked, ["a" * 32])
+        bot._handle_text(100, "/settings")
+        summary = self.api.messages[-1][1]
+        for command in ("/duration", "/receivers", "/pre_roll", "/storage_gb", "/reserve_gb", "/outage_alerts"):
+            self.assertIn(command, summary)
 
-    def test_health_notifications_debounce_and_report_recovery_once(self):
-        code = self.store.issue_claim()
-        self.store.claim_owner(code, 100, 100)
+        bot._handle_text(100, "/web")
+        self.assertEqual(runtime.web_chats, [100])
+        bot._handle_text(100, "/web_password shortsecret")
+        self.assertEqual(runtime.web_passwords, [])
+        bot._handle_text(100, "/web_password synthetic-password")
+        self.assertEqual(runtime.web_passwords, ["synthetic-password"])
+
+    def test_recording_commands_validate_and_route_to_runtime_manager(self):
         self.store.state["cameras"] = [{"slot": 1, "name": "Camera 1"}]
         self.store.save()
-        self.manager.health_values[1] = {"process": "running", "healthy": False}
-        notifier = HealthNotifier(self.bot)
+        recordings = FakeRecordingSettings()
+        bot = V380Bot(self.store, self.api, self.manager, recordings=recordings)
 
-        notifier.check_once(now=10)
-        notifier.check_once(now=19)
-        self.assertFalse(any("unavailable" in text for _, text in self.api.messages))
-        notifier.check_once(now=20)
-        notifier.check_once(now=30)
-        outage_messages = [text for _, text in self.api.messages if "unavailable" in text]
-        self.assertEqual(len(outage_messages), 1)
+        for command in ("/recording off", "/sensitivity high", "/retention 14"):
+            bot._handle_text(100, command)
+        self.assertEqual(
+            recordings.changes,
+            [(1, "enabled", False), (1, "sensitivity", "high"), (1, "retention_days", 14)],
+        )
 
-        self.manager.health_values[1] = {"process": "running", "healthy": True}
-        notifier.check_once(now=35)
-        notifier.check_once(now=40)
-        recovery_messages = [text for _, text in self.api.messages if "healthy again" in text]
-        self.assertEqual(len(recovery_messages), 1)
+        changes_before_invalid = len(recordings.changes)
+        for command in ("/recording maybe", "/sensitivity extreme", "/retention 31", "/retention 0"):
+            bot._handle_text(100, command)
+        self.assertEqual(len(recordings.changes), changes_before_invalid)
 
 
 class TelegramClientTests(unittest.TestCase):

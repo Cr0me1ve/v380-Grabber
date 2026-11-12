@@ -25,7 +25,7 @@ from typing import Any, Callable
 from auth_backend import AccountBackendError, AuthorizationBackend, BootstrapValidationError
 
 
-MAX_CAMERAS = 2
+MAX_CAMERAS = 1
 MAX_BOOTSTRAP_BYTES = 64 * 1024
 CLAIM_TTL_SECONDS = 15 * 60
 LONG_POLL_SECONDS = 20
@@ -38,8 +38,8 @@ MENU = {
         [{"text": "Login with V380 QR"}],
         [{"text": "Add camera"}, {"text": "Status"}],
         [{"text": "Check stream"}, {"text": "Edit bootstrap"}],
-        [{"text": "Restart receiver"}, {"text": "Recording"}],
-        [{"text": "Help"}],
+        [{"text": "Restart camera"}, {"text": "Recording"}],
+        [{"text": "Settings"}, {"text": "Web viewer"}, {"text": "Help"}],
     ],
     "resize_keyboard": True,
 }
@@ -52,8 +52,11 @@ MENU_ACTIONS = {
     "ping": "/ping",
     "edit bootstrap": "/edit",
     "restart receiver": "/restart",
+    "restart camera": "/restart",
     "recording": "/recording",
     "help": "/help",
+    "settings": "/settings",
+    "web viewer": "/web",
     "cancel": "/cancel",
 }
 
@@ -259,7 +262,7 @@ class TelegramAPI:
         parts = [
             f"--{boundary}\r\nContent-Disposition: form-data; name=\"chat_id\"\r\n\r\n{chat_id}\r\n".encode(),
             f"--{boundary}\r\nContent-Disposition: form-data; name=\"caption\"\r\n\r\n{caption}\r\n".encode(),
-            f"--{boundary}\r\nContent-Disposition: form-data; name=\"photo\"; filename=\"login.png\"\r\nContent-Type: image/png\r\n\r\n".encode(),
+            f"--{boundary}\r\nContent-Disposition: form-data; name=\"photo\"; filename=\"{('frame.jpg' if image.startswith(bytes([255,216])) else 'login.png')}\"\r\nContent-Type: {('image/jpeg' if image.startswith(bytes([255,216])) else 'image/png')}\r\n\r\n".encode(),
             image,
             f"\r\n--{boundary}--\r\n".encode(),
         ]
@@ -273,7 +276,7 @@ class TelegramAPI:
             with self._opener(request, timeout=30) as response:
                 raw = response.read(2 * 1024 * 1024 + 1)
         except Exception:
-            raise BotError("Telegram could not send the login QR image.") from None
+            raise BotError("Telegram could not send the image.") from None
         if len(raw) > 2 * 1024 * 1024:
             raise BotError("Telegram returned an oversized response.")
         try:
@@ -352,241 +355,7 @@ class TelegramAPI:
         return raw
 
 
-class ReceiverManager:
-    def __init__(
-        self,
-        store: StateStore,
-        app_dir: str | Path = "/app",
-        popen: Callable[..., subprocess.Popen[Any]] | None = None,
-    ):
-        self.store = store
-        self.app_dir = Path(app_dir)
-        self._popen = popen or subprocess.Popen
-        self.children: dict[int, subprocess.Popen[Any]] = {}
-        self.started_at: dict[int, float] = {}
-        self._lock = threading.RLock()
-
-    def _spawn(self, slot: int) -> subprocess.Popen[Any]:
-        camera_path = self.store.camera_config_path(slot)
-        if not camera_path.is_file():
-            raise BotError("Local camera configuration is missing.")
-        port = 8080 + slot
-        env = os.environ.copy()
-        env.pop("TELEGRAM_BOT_TOKEN", None)
-        env.pop("TELEGRAM_TOKEN_FILE", None)
-        env["PYTHONUNBUFFERED"] = "1"
-        try:
-            child = self._popen(
-                [
-                    sys.executable,
-                    str(self.app_dir / "stream_service.py"),
-                    "--credentials",
-                    str(camera_path),
-                    "--port",
-                    str(port),
-                    "--quality",
-                    "1",
-                ],
-                stdin=subprocess.DEVNULL,
-                stdout=None,
-                stderr=None,
-                close_fds=True,
-                start_new_session=True,
-                env=env,
-            )
-        except Exception:
-            raise BotError("Could not start the camera receiver process.") from None
-        self.children[slot] = child
-        self.started_at[slot] = time.monotonic()
-        return child
-
-    def stop(self, slot: int) -> None:
-        with self._lock:
-            child = self.children.pop(slot, None)
-            self.started_at.pop(slot, None)
-            if child is None or child.poll() is not None:
-                return
-            try:
-                child.terminate()
-                child.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                child.kill()
-                child.wait(timeout=3)
-            except Exception:
-                pass
-
-    def start(self, slot: int) -> bool:
-        with self._lock:
-            existing = self.children.get(slot)
-            if existing is not None and existing.poll() is None:
-                return True
-            self.children.pop(slot, None)
-            self.started_at.pop(slot, None)
-            try:
-                self._spawn(slot)
-                return True
-            except BotError:
-                return False
-
-    def restart(self, slot: int) -> bool:
-        with self._lock:
-            self.stop(slot)
-            return self.start(slot)
-
-    def start_all(self) -> None:
-        for camera in self.store.cameras:
-            slot = camera.get("slot")
-            if slot in (1, 2):
-                self.start(slot)
-
-    def ensure_all(self, stop_event: threading.Event) -> None:
-        while not stop_event.wait(5):
-            for camera in self.store.cameras:
-                slot = camera.get("slot")
-                if slot not in (1, 2):
-                    continue
-                with self._lock:
-                    child = self.children.get(slot)
-                    last_start = self.started_at.get(slot, 0)
-                if (child is None or child.poll() is not None) and time.monotonic() - last_start >= 5:
-                    self.start(slot)
-
-    def health(self, slot: int) -> dict[str, Any]:
-        with self._lock:
-            child = self.children.get(slot)
-            if child is None:
-                return {"process": "stopped", "healthy": False}
-            if child.poll() is not None:
-                return {"process": "exited", "healthy": False}
-        port = 8080 + slot
-        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=HEALTH_TIMEOUT_SECONDS)
-        try:
-            connection.request("GET", "/health.json", headers={"Connection": "close"})
-            response = connection.getresponse()
-            raw = response.read(64 * 1024)
-            status = json.loads(raw.decode("utf-8"))
-            if not isinstance(status, dict):
-                raise ValueError
-            return {
-                "process": "running",
-                "healthy": bool(status.get("healthy")),
-                "fps": status.get("fps") if isinstance(status.get("fps"), (int, float)) else 0,
-                "age": status.get("age") if isinstance(status.get("age"), (int, float)) else None,
-            }
-        except Exception:
-            return {"process": "running", "healthy": False}
-        finally:
-            connection.close()
-
-    def shutdown(self) -> None:
-        with self._lock:
-            slots = list(self.children)
-        for slot in slots:
-            self.stop(slot)
-
-
-class RecordingManager:
-    def __init__(self, store: StateStore, recorder_factory: Callable[..., Any] | None = None):
-        self.store = store
-        self._factory = recorder_factory
-        self._recorders: dict[int, Any] = {}
-        self._lock = threading.RLock()
-
-    def _recorder_factory(self) -> Callable[..., Any]:
-        if self._factory is None:
-            from motion_recorder import MotionRecorder
-
-            self._factory = MotionRecorder
-        return self._factory
-
-    def settings(self, slot: int) -> dict[str, Any]:
-        camera = next((item for item in self.store.cameras if item.get("slot") == slot), {})
-        raw = camera.get("recording") if isinstance(camera, dict) else None
-        raw = raw if isinstance(raw, dict) else {}
-        sensitivity = raw.get("sensitivity")
-        if sensitivity not in ("low", "medium", "high"):
-            sensitivity = "medium"
-        days = raw.get("retention_days", 7)
-        if not isinstance(days, int) or isinstance(days, bool) or not 1 <= days <= 30:
-            days = 7
-        return {"enabled": bool(raw.get("enabled", False)), "sensitivity": sensitivity, "retention_days": days}
-
-    def ensure_slot(self, slot: int) -> Any | None:
-        if slot not in (1, 2):
-            return None
-        configured = any(camera.get("slot") == slot for camera in self.store.cameras)
-        with self._lock:
-            recorder = self._recorders.get(slot)
-            if recorder is None:
-                source_url = f"http://127.0.0.1:{8080 + slot}/video.mjpg"
-                recorder = self._recorder_factory()(
-                    source_url,
-                    self.store.data_dir / "recordings",
-                    slot,
-                    lambda current_slot=slot: self.settings(current_slot),
-                )
-                self._recorders[slot] = recorder
-            if configured:
-                recorder.start()
-            return recorder
-
-    def start_all(self) -> None:
-        for slot in (1, 2):
-            self.ensure_slot(slot)
-
-    def set_setting(self, slot: int, name: str, value: Any) -> bool:
-        if name not in ("enabled", "sensitivity", "retention_days"):
-            return False
-        cameras = self.store.cameras
-        target = next((camera for camera in cameras if camera.get("slot") == slot), None)
-        if target is None:
-            return False
-        settings = dict(target.get("recording") or {})
-        settings.setdefault("enabled", False)
-        settings.setdefault("sensitivity", "medium")
-        settings.setdefault("retention_days", 7)
-        settings[name] = value
-        target["recording"] = settings
-        self.store.state["cameras"] = cameras
-        self.store.save()
-        self.ensure_slot(slot)
-        return True
-
-    def status(self, slot: int) -> dict[str, Any]:
-        with self._lock:
-            recorder = self._recorders.get(slot)
-        if recorder is None:
-            return {"enabled": self.settings(slot)["enabled"], "recording": False, "source_healthy": False, "queued": 0}
-        try:
-            return recorder.status()
-        except Exception:
-            return {"enabled": self.settings(slot)["enabled"], "recording": False, "source_healthy": False, "queued": 0}
-
-    def pending(self) -> list[tuple[Any, dict[str, Any]]]:
-        with self._lock:
-            recorders = list(self._recorders.values())
-        result: list[tuple[Any, dict[str, Any]]] = []
-        for recorder in recorders:
-            try:
-                result.extend((recorder, item) for item in recorder.pending())
-            except Exception:
-                continue
-        return result
-
-    def stop_slot(self, slot: int) -> None:
-        with self._lock:
-            recorder = self._recorders.get(slot)
-        if recorder is not None:
-            try:
-                recorder.stop()
-            except Exception:
-                pass
-
-    def stop_all(self) -> None:
-        with self._lock:
-            slots = list(self._recorders)
-        for slot in slots:
-            self.stop_slot(slot)
+from nvr_runtime import ReceiverManager, RecordingManager
 
 
 class V380Bot:
@@ -663,7 +432,7 @@ class V380Bot:
         finally:
             message_id = message.get("message_id")
             should_delete = is_claim and owner is None
-            should_delete = should_delete or (owns_chat and (document is not None or is_claim))
+            should_delete = should_delete or (owns_chat and (document is not None or is_claim or command_text.lower().startswith("/web_password ")))
             if should_delete and isinstance(message_id, int):
                 try:
                     self.api.delete_message(chat_id, message_id)
@@ -699,7 +468,7 @@ class V380Bot:
             self._send(chat_id, self._help_text(), menu=True)
         elif command == "/add":
             if len(self.store.cameras) >= MAX_CAMERAS:
-                self._send(chat_id, "The two receiver slots are full. Edit or remove a camera first.")
+                self._send(chat_id, "A camera is already configured. Use /login 1 to replace or refresh it. Edit or remove a camera first.")
             else:
                 self.dialogs[chat_id] = ("add", None)
                 self._send(chat_id, self._import_prompt())
@@ -711,6 +480,9 @@ class V380Bot:
                 self.dialogs[chat_id] = ("edit", slot)
                 self._send(chat_id, f"Upload the replacement authorized bootstrap JSON for camera {slot} as a document.")
         elif command in ("/status", "/check", "/ping"):
+            if hasattr(self.manager,"ping"):
+                self.manager.ping(chat_id)
+                return
             self._send_status(chat_id, command in ("/check", "/ping"), argument)
         elif command == "/restart":
             slot = self._resolve_slot(argument)
@@ -745,6 +517,8 @@ class V380Bot:
             self._cancel_login(chat_id)
             self.dialogs.pop(chat_id, None)
             self._send(chat_id, "Pending action cancelled.", menu=True)
+        elif command in ("/settings","/duration","/clip_seconds","/receivers","/pre_roll","/storage_gb","/reserve_gb","/notifications","/outage_alerts","/web","/web_password"):
+            self._settings_command(chat_id,command,argument)
         elif command == "/recording":
             self._handle_recording(chat_id, argument)
         elif command == "/sensitivity":
@@ -753,13 +527,13 @@ class V380Bot:
             self._handle_retention(chat_id, argument)
         elif command == "/login":
             if argument and self._parse_slot(argument) is None:
-                self._send(chat_id, "Use /login to add a camera or /login 1|2 to refresh or replace that receiver.")
+                self._send(chat_id, "Use /login to add a camera or /login 1 to refresh or replace that receiver.")
             else:
                 target_slot = self._parse_slot(argument) if argument else None
                 if target_slot and not any(camera.get("slot") == target_slot for camera in self.store.cameras):
                     self._send(chat_id, f"Camera slot {target_slot} is not configured. Use /login to add a camera.")
                 elif target_slot is None and len(self.store.cameras) >= MAX_CAMERAS:
-                    self._send(chat_id, "The two receiver slots are full. Use /login 1 or /login 2 to refresh one, or remove a camera first.")
+                    self._send(chat_id, "A camera is already configured. Use /login 1 to replace or refresh it. Use /login 1 or /login 2 to refresh one, or remove a camera first.")
                 else:
                     self._start_qr_login(chat_id, target_slot)
         elif command == "/select":
@@ -803,10 +577,10 @@ class V380Bot:
     ) -> None:
         cameras = list(self.store.cameras)
         if action == "add":
-            slot = next((candidate for candidate in (1, 2) if all(c.get("slot") != candidate for c in cameras)), None)
+            slot = next((candidate for candidate in range(1,MAX_CAMERAS+1) if all(c.get("slot") != candidate for c in cameras)), None)
             if slot is None:
                 self.dialogs.pop(chat_id, None)
-                self._send(chat_id, "The two receiver slots are full.")
+                self._send(chat_id, "A camera is already configured. Use /login 1 to replace or refresh it.")
                 return
         else:
             slot = requested_slot
@@ -831,8 +605,7 @@ class V380Bot:
                     {
                         "slot": slot,
                         "name": f"Camera {slot}",
-                        "recording": {"enabled": False, "sensitivity": "medium", "retention_days": 7},
-                    }
+                                            }
                 )
                 self.store.state["cameras"] = sorted(cameras, key=lambda camera: camera["slot"])
                 self.store.save()
@@ -1037,6 +810,26 @@ class V380Bot:
             if camera.get("slot") in (1, 2)
         )
 
+    def _settings_command(self,chat_id,command,argument):
+        runtime=getattr(self.manager,"runtime",None)
+        if runtime is None:
+            self._send(chat_id,"NVR runtime is unavailable.");return
+        if command=="/settings":
+            values=runtime.settings()
+            self._send(chat_id,"\n".join(["Camera settings:",f"/duration {values['duration']} — clip seconds (5–120)",f"/receivers {values['receivers']} — parallel receivers (1–4)",f"/pre_roll {values['pre_roll']} — history seconds (0–10)",f"/sensitivity {values['sensitivity']} — low, medium, high",f"/retention {values['retention_days']} — archive days (1–30)",f"/storage_gb {values['storage_gb']} — archive size limit",f"/reserve_gb {values['reserve_gb']} — free disk reserve",f"/recording {'on' if values['enabled'] else 'off'}",f"/notifications {'on' if values['notifications'] else 'off'} — motion videos",f"/outage_alerts {'on' if values['outage_alerts'] else 'off'}","/web — viewer and login","/web_password PASSWORD — change web password"]));return
+        if command=="/web":runtime.web(chat_id);return
+        if command=="/web_password":
+            try:runtime.web_password(argument)
+            except ValueError as error:self._send(chat_id,str(error));return
+            self._send(chat_id,"Web password updated. The viewer is reconnecting.");return
+        from nvr_config import validate_setting
+        key=command[1:];key='duration' if key=='clip_seconds' else key
+        try:value=validate_setting(key,argument)
+        except ValueError as error:self._send(chat_id,str(error));return
+        try:runtime.set_setting(key,value)
+        except ValueError as error:self._send(chat_id,str(error));return
+        self._send(chat_id,key+" updated to "+str(value)+". Existing queued clips keep their original settings.")
+
     def _handle_recording(self, chat_id: int, argument: str) -> None:
         if self.recordings is None:
             self._send(chat_id, "Motion recording is unavailable in this build.")
@@ -1064,7 +857,7 @@ class V380Bot:
         action = parts[0].casefold()
         slot_argument = parts[1] if len(parts) == 2 else ""
         if action not in ("on", "off") or len(parts) > 2:
-            self._send(chat_id, "Use /recording on [1|2], /recording off [1|2], or /recording to view status.")
+            self._send(chat_id, "Use /recording on [1], /recording off [1], or /recording to view status.")
             return
         slots = self._target_slots(slot_argument)
         if not slots:
@@ -1082,7 +875,7 @@ class V380Bot:
             return
         parts = argument.split()
         if not parts or parts[0].casefold() not in ("low", "medium", "high") or len(parts) > 2:
-            self._send(chat_id, "Use /sensitivity low|medium|high [1|2]. With no camera number, the setting applies to all cameras.")
+            self._send(chat_id, "Use /sensitivity low|medium|high [1]. With no camera number, the setting applies to all cameras.")
             return
         slots = self._target_slots(parts[1] if len(parts) == 2 else "")
         if not slots:
@@ -1099,7 +892,7 @@ class V380Bot:
             return
         parts = argument.split()
         if not parts or len(parts) > 2 or not parts[0].isdigit():
-            self._send(chat_id, "Use /retention DAYS [1|2], where DAYS is from 1 to 30. With no camera number, the setting applies to all cameras.")
+            self._send(chat_id, "Use /retention DAYS [1], where DAYS is from 1 to 30. With no camera number, the setting applies to all cameras.")
             return
         days = int(parts[0])
         if not 1 <= days <= 30:
@@ -1132,7 +925,7 @@ class V380Bot:
             return
         slot = self._parse_slot(argument) if argument else None
         if argument and slot is None:
-            self._send(chat_id, "Use /status 1 or /status 2.")
+            self._send(chat_id, "Use /status or /status 1.")
             return
         selected = [camera for camera in cameras if slot is None or camera.get("slot") == slot]
         lines: list[str] = []
@@ -1166,104 +959,22 @@ class V380Bot:
     @staticmethod
     def _help_text() -> str:
         return (
-            "Private V380 receiver controls:\n"
+            "Private V380 NVR controls:\n"
+            "/settings — all camera and recording settings\n"
+            "/web — web viewer and login\n"
             "/add — import an authorized bootstrap for a camera\n"
             "/login — sign in with a one-time V380 QR and select a camera\n"
-            "/login 1|2 — refresh or replace that receiver by QR\n"
-            "/status [1|2] — show receiver and frame health\n"
-            "/check or /ping [1|2] — check the local health endpoint\n"
-            "/edit 1|2 — replace a camera bootstrap\n"
-            "/restart [1|2] — restart a receiver\n"
-            "/remove 1|2 — remove after /confirm\n"
-            "/recording [on|off] [1|2] — control motion recording\n"
-            "/sensitivity low|medium|high [1|2] — tune motion detection\n"
-            "/retention DAYS [1|2] — keep clips for 1 to 30 days\n"
+            "/login 1 — refresh or replace that receiver by QR\n"
+            "/status [1] — show receiver and frame health\n"
+            "/check or /ping [1] — check the local health endpoint\n"
+            "/edit 1 — replace a camera bootstrap\n"
+            "/restart [1] — restart a receiver\n"
+            "/remove 1 — remove after /confirm\n"
+            "/recording [on|off] [1] — control motion recording\n"
+            "/sensitivity low|medium|high [1] — tune motion detection\n"
+            "/retention DAYS [1] — keep clips for 1 to 30 days\n"
             "/cancel — cancel a pending dialog"
         )
-
-
-class ClipDelivery:
-    def __init__(self, api: TelegramAPI, store: StateStore, recordings: RecordingManager):
-        self.api = api
-        self.store = store
-        self.recordings = recordings
-        self.retry_after: dict[str, float] = {}
-
-    def deliver_once(self, now: float | None = None) -> None:
-        owner = self.store.owner
-        if not owner or not isinstance(owner.get("chat_id"), int):
-            return
-        current = time.monotonic() if now is None else now
-        for recorder, item in self.recordings.pending():
-            clip_id = item.get("id")
-            if not isinstance(clip_id, str) or current < self.retry_after.get(clip_id, 0):
-                continue
-            slot = item.get("slot")
-            if slot not in (1, 2):
-                continue
-            created_at = item.get("created_at")
-            try:
-                timestamp = datetime.fromtimestamp(float(created_at), timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-            except (TypeError, ValueError, OverflowError, OSError):
-                timestamp = "time unavailable"
-            duration = item.get("duration")
-            if not isinstance(duration, (int, float)) or isinstance(duration, bool) or not 1 <= duration <= 300:
-                duration = 30
-            caption = f"Motion detected on camera {slot}. Event time: {timestamp}. Clip length: {int(duration)} seconds."
-            try:
-                result = self.api.send_video(owner["chat_id"], item.get("path", ""), caption)
-                if not isinstance(result, dict):
-                    raise BotError("Telegram did not acknowledge the motion clip.")
-            except Exception:
-                self.retry_after[clip_id] = current + 30
-                continue
-            try:
-                recorder.ack(clip_id)
-                self.retry_after.pop(clip_id, None)
-            except Exception:
-                self.retry_after[clip_id] = current + 30
-
-    def run(self, stop_event: threading.Event) -> None:
-        while not stop_event.wait(5):
-            self.deliver_once()
-
-
-class HealthNotifier:
-    def __init__(self, bot: V380Bot):
-        self.bot = bot
-        self.unhealthy_since: dict[int, float] = {}
-        self.alerted: set[int] = set()
-
-    def check_once(self, now: float | None = None) -> None:
-        current = time.monotonic() if now is None else now
-        owner = self.bot.store.owner
-        if not owner or not isinstance(owner.get("chat_id"), int):
-            return
-        configured = {
-            camera.get("slot")
-            for camera in self.bot.store.cameras
-            if camera.get("slot") in (1, 2)
-        }
-        for slot in list(self.unhealthy_since):
-            if slot not in configured:
-                self.unhealthy_since.pop(slot, None)
-                self.alerted.discard(slot)
-        for slot in sorted(configured):
-            info = self.bot.manager.health(slot)
-            if info.get("healthy"):
-                self.unhealthy_since.pop(slot, None)
-                if slot in self.alerted:
-                    if self.bot._send(owner["chat_id"], f"Camera {slot} stream is healthy again."):
-                        self.alerted.discard(slot)
-                continue
-            self.unhealthy_since.setdefault(slot, current)
-            if slot not in self.alerted and current - self.unhealthy_since[slot] >= 10:
-                if self.bot._send(owner["chat_id"], f"Camera {slot} stream is unavailable. The receiver is retrying automatically."):
-                    self.alerted.add(slot)
-
-    def run(self, stop_event: threading.Event) -> None:
-        while not stop_event.wait(5):
-            self.check_once()
 
 
 def _monitor_receivers(manager: ReceiverManager, stop_event: threading.Event) -> None:
@@ -1277,20 +988,25 @@ def run_bot(
     auth_backend: AuthorizationBackend | None = None,
     recordings: RecordingManager | None = None,
 ) -> None:
-    recordings = recordings or RecordingManager(store)
+    from nvr_runtime import NvrRuntime
+    runtime=NvrRuntime(api,store)
+    manager=runtime.manager
+    recordings=runtime.recordings
     bot = V380Bot(store, api, manager, auth_backend, recordings)
     stop_event = threading.Event()
     signal.signal(signal.SIGTERM, lambda *_: stop_event.set())
     signal.signal(signal.SIGINT, lambda *_: stop_event.set())
     manager.start_all()
     recordings.start_all()
+    runtime.start()
     workers = [
         threading.Thread(target=_monitor_receivers, args=(manager, stop_event), daemon=True),
-        threading.Thread(target=HealthNotifier(bot).run, args=(stop_event,), daemon=True),
-        threading.Thread(target=ClipDelivery(api, store, recordings).run, args=(stop_event,), daemon=True),
     ]
     for worker in workers:
         worker.start()
+    try:
+        api._json_call("setMyCommands",{"commands":[{"command":command,"description":description} for command,description in [("ping","Fresh camera frame and recording health"),("settings","All camera and recording settings"),("duration","Video length in seconds, 5 to 120"),("receivers","Parallel receivers, 1 to 4"),("pre_roll","Video history, 0 to 10 seconds"),("recording","Motion recording on or off"),("sensitivity","Motion sensitivity: low, medium, high"),("retention","Archive retention in days"),("storage_gb","Archive storage limit in GB"),("reserve_gb","Free disk reserve in GB"),("notifications","Motion videos on or off"),("outage_alerts","Connection alerts on or off"),("web","Web viewer and login"),("login","Configure or refresh camera through V380 QR"),("restart","Reconnect the camera receivers")]]})
+    except Exception:pass
     print("V380 Grabber bot started.")
     while not stop_event.is_set():
         try:
@@ -1319,6 +1035,7 @@ def run_bot(
                     break
     for cancel in list(bot.qr_events.values()):
         cancel.set()
+    runtime.shutdown()
     recordings.stop_all()
     manager.shutdown()
     for worker in workers:
@@ -1327,10 +1044,13 @@ def run_bot(
 
 def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
-    data_dir = Path(os.environ.get("DATA_DIR", "/data"))
+    from nvr_config import DATA
+    data_dir = DATA
     try:
         store = StateStore(data_dir)
         if args == ["issue-claim"]:
+            if store.owner:
+                print("An owner is already paired.");return 0
             code = store.issue_claim()
             print("One-time owner claim code (valid for 15 minutes):")
             print(code)
@@ -1338,10 +1058,9 @@ def main(argv: list[str] | None = None) -> int:
         if args not in ([], ["serve"]):
             print("Supported commands: serve, issue-claim")
             return 2
-        token_path = os.environ.get("TELEGRAM_TOKEN_FILE", "/run/secrets/telegram_bot_token")
+        token_path = os.environ.get("TELEGRAM_TOKEN_FILE",str(Path(__file__).resolve().parent/"secrets/telegram_bot_token"))
         api = TelegramAPI.from_secret_file(token_path)
-        manager = ReceiverManager(store)
-        run_bot(api, store, manager, recordings=RecordingManager(store))
+        run_bot(api, store, None)
         return 0
     except BotError as exc:
         print(str(exc), file=sys.stderr)

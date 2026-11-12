@@ -1,0 +1,7 @@
+FROM ghcr.io/motioneye-project/motioneye@sha256:7da31d62e6c46ee8b61280f872801e429ec6f3db81bb23aca11c83863939cade
+RUN sed -i "s/^\(motion:[^:]*\):[0-9]*:[0-9]*:\(.*\)/\1:1000:1000:\2/" /etc/passwd && sed -i "s/^\(motion:[^:]*\):[0-9]*:\(.*\)/\1:1000:\2/" /etc/group && chown -R 1000:1000 /var/log/motioneye /var/lib/motioneye
+USER 1000:1000
+ARG V380_REVISION=local
+LABEL org.opencontainers.image.revision=$V380_REVISION
+ENTRYPOINT ["/usr/local/bin/meyectl"]
+CMD ["startserver", "-c", "/etc/motioneye/motioneye.conf"]
