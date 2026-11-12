@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import tempfile
 import unittest
 from collections import deque
@@ -8,7 +9,9 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import bot as bot_module
 import nvr_config
+import nvr_runtime
 import nvr_worker
 from runtime import source_selector
 
@@ -157,6 +160,144 @@ class DurableMotionQueueTests(unittest.TestCase):
             self.assertTrue(state["done"])
             self.assertEqual(state["message_id"], 901)
             self.assertTrue(video_path.is_file())
+
+
+class StartupRecoveryTests(unittest.TestCase):
+    def test_bot_stays_up_and_starts_watchdog_when_docker_is_down(self):
+        watchdog_started = threading.Event()
+        handlers = {}
+
+        class Manager:
+            def __init__(self):
+                self.start_attempts = 0
+                self.shutdown_called = False
+
+            def start_all(self):
+                self.start_attempts += 1
+                raise OSError("synthetic Docker daemon failure")
+
+            def ensure_all(self, stop_event):
+                watchdog_started.set()
+                stop_event.wait(2)
+
+            def shutdown(self):
+                self.shutdown_called = True
+
+        class Recordings:
+            def __init__(self):
+                self.started = False
+                self.stopped = False
+
+            def start_all(self):
+                self.started = True
+
+            def stop_all(self):
+                self.stopped = True
+
+        class Runtime:
+            def __init__(self, *_args):
+                self.manager = Manager()
+                self.recordings = Recordings()
+                self.started = False
+                self.stopped = False
+
+            def start(self):
+                self.started = True
+
+            def shutdown(self):
+                self.stopped = True
+
+        class API:
+            def _json_call(self, *_args, **_kwargs):
+                return {}
+
+            def get_updates(self, _offset):
+                if not watchdog_started.wait(2):
+                    raise AssertionError("watchdog did not start after Docker failure")
+                handlers[bot_module.signal.SIGTERM](bot_module.signal.SIGTERM, None)
+                return []
+
+        runtime = Runtime(None)
+        store = SimpleNamespace(offset=0, owner=None, set_offset=lambda _offset: None)
+        with (
+            patch("nvr_runtime.NvrRuntime", return_value=runtime),
+            patch.object(bot_module.signal, "signal", side_effect=lambda sig, handler: handlers.__setitem__(sig, handler)),
+        ):
+            bot_module.run_bot(API(), store, None)
+
+        self.assertEqual(runtime.manager.start_attempts, 1)
+        self.assertTrue(runtime.recordings.started)
+        self.assertTrue(runtime.started)
+        self.assertTrue(runtime.stopped)
+        self.assertTrue(runtime.recordings.stopped)
+        self.assertTrue(runtime.manager.shutdown_called)
+
+    def test_watchdog_starts_docker_and_recreates_missing_stack(self):
+        class StopAfterOnePass:
+            def __init__(self):
+                self.wait_calls = 0
+
+            def wait(self, _seconds):
+                self.wait_calls += 1
+                return self.wait_calls > 1
+
+        runtime = SimpleNamespace(
+            store=SimpleNamespace(cameras=[{"slot": 1}]),
+            data=Path(tempfile.gettempdir()) / "v380-synthetic-watchdog-test",
+            settings=lambda: {"receivers": 2},
+            worker=SimpleNamespace(inspect_container=lambda _name: (False, None)),
+        )
+        manager = nvr_runtime.ReceiverManager(runtime)
+        restarted_slots = []
+        manager.start = restarted_slots.append
+        stop_event = StopAfterOnePass()
+
+        def systemctl(command, **_kwargs):
+            if command[1] == "is-active":
+                return SimpleNamespace(returncode=3)
+            return SimpleNamespace(returncode=0)
+
+        with patch.object(nvr_runtime.subprocess, "run", side_effect=systemctl) as run:
+            manager.ensure_all(stop_event)
+
+        self.assertIn(["systemctl", "start", "docker.service"], [call.args[0] for call in run.call_args_list])
+        self.assertEqual(restarted_slots, [1])
+
+
+class CameraReplacementTests(unittest.TestCase):
+    def test_replacement_stops_all_replicas_before_starting_new_camera(self):
+        with tempfile.TemporaryDirectory() as temp:
+            camera_config = Path(temp) / "cameras" / "camera-1.json"
+            compose_calls = []
+            runtime = SimpleNamespace(
+                lock=threading.RLock(),
+                device_id=111,
+                data=Path(temp),
+                store=SimpleNamespace(
+                    load_camera_config=lambda _slot: {"device_id": 222},
+                    camera_config_path=lambda _slot: camera_config,
+                ),
+                settings=lambda: {"receivers": 4},
+                apply_settings=lambda: None,
+            )
+
+            def compose(*args, timeout=120):
+                compose_calls.append((args, timeout, runtime.device_id))
+
+            runtime.compose = compose
+            manager = nvr_runtime.ReceiverManager(runtime)
+
+            with (
+                patch.object(nvr_runtime.cfg, "initialize"),
+                patch.object(nvr_runtime.os, "geteuid", return_value=1000),
+                patch.object(nvr_runtime.subprocess, "run", return_value=SimpleNamespace(returncode=0)),
+            ):
+                self.assertTrue(manager.restart(1))
+
+        self.assertEqual(runtime.device_id, 222)
+        self.assertEqual(compose_calls[0], (("stop", "receiver"), 90, 111))
+        self.assertEqual(compose_calls[1], (("up", "-d", "--scale", "receiver=4"), 120, 222))
+        self.assertEqual(len(compose_calls), 2)
 
 
 class SelectorEventPlanTests(unittest.TestCase):

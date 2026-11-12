@@ -5,7 +5,7 @@ if ' ' in str(root):raise SystemExit('Install under a path without spaces, such 
 unit=f'''[Unit]
 Description=Telegram-managed V380 Grabber NVR
 After=network-online.target docker.service
-Wants=network-online.target
+Wants=network-online.target docker.service
 [Service]
 Type=simple
 WorkingDirectory={root}

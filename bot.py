@@ -996,7 +996,10 @@ def run_bot(
     stop_event = threading.Event()
     signal.signal(signal.SIGTERM, lambda *_: stop_event.set())
     signal.signal(signal.SIGINT, lambda *_: stop_event.set())
-    manager.start_all()
+    try:
+        manager.start_all()
+    except Exception:
+        print("Camera stack is not ready; the host watchdog will retry.",flush=True)
     recordings.start_all()
     runtime.start()
     workers = [
