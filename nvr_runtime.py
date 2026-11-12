@@ -6,7 +6,7 @@ import nvr_config as cfg
 
 class NvrRuntime:
  def __init__(self,api,store):
-  self.api=api;self.store=store;self.data=store.data_dir.resolve();self.stop_event=threading.Event();self.lock=threading.RLock();self.threads=[];self.last_ensure=0
+  self.api=api;self.store=store;self.data=store.data_dir.resolve();self.stop_event=threading.Event();self.lock=threading.RLock();self.threads=[];self.last_ensure=0;self.device_id=(store.load_camera_config(1) or {}).get("device_id")
   if self.data!=cfg.DATA:raise RuntimeError('DATA_DIR must match the deployment data directory')
   cfg.initialize()
   import nvr_worker
@@ -83,6 +83,8 @@ class NvrRuntime:
 class ReceiverManager:
  def __init__(self,runtime):self.runtime=runtime
  def start(self,slot):
+  with self.runtime.lock:return self._start(slot)
+ def _start(self,slot):
   if slot!=1:raise ValueError('This NVR supports one camera with up to four parallel receivers')
   runtime=self.runtime;cfg.initialize();path=runtime.store.camera_config_path(slot)
   if os.geteuid()==0:os.chown(path,1000,1000)
@@ -91,9 +93,17 @@ class ReceiverManager:
    if result.returncode:subprocess.run(['docker','network','create',name],check=True,capture_output=True)
   runtime.apply_settings();runtime.compose('up','-d','--scale','receiver='+str(runtime.settings()['receivers']))
   return True
- def stop(self,slot):self.runtime.compose('stop',timeout=90)
+ def stop(self,slot):
+  with self.runtime.lock:self.runtime.compose('stop',timeout=90)
  def restart(self,slot):
+  with self.runtime.lock:return self._restart(slot)
+ def _restart(self,slot):
   if slot!=1:return False
+  new_device=(self.runtime.store.load_camera_config(1) or {}).get('device_id')
+  if new_device!=self.runtime.device_id:
+   self.runtime.compose('stop','receiver',timeout=90)
+   self.runtime.device_id=new_device
+   return self._start(1)
   if os.geteuid()==0:os.chown(self.runtime.store.camera_config_path(slot),1000,1000)
   for index in range(1,self.runtime.settings()['receivers']+1):
    name=cfg.PROJECT+'-receiver-'+str(index)
