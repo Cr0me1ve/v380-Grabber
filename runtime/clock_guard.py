@@ -2,7 +2,8 @@
 import hashlib,json,math,subprocess,sys,os
 from pathlib import Path
 from PIL import Image,ImageChops,ImageFilter
-VERSION=5
+VERSION=6
+MAX_FLAT_GAP_SAMPLES=3  # At 5 Hz, allow a brief exposure change between verified frames.
 def normalize_glyph(im):
  return ImageChops.subtract(im,im.filter(ImageFilter.GaussianBlur(2)),scale=1,offset=128)
 class ClockGuard:
@@ -44,6 +45,8 @@ class ClockGuard:
  def validate_video(self,path,min_frames=145):
   cmd=['ffmpeg','-v','error','-i',str(path),'-an','-vf','fps=5,scale=640:360,format=gray','-threads','1','-f','rawvideo','pipe:1']
   p=subprocess.Popen(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE);count=0;changes=0;old=None;first_bad=None;size=640*360;missing=0;max_missing=0;clear=0;dropouts=0
+  flat_gap_start=None
+  flat_samples=0
   try:
    while True:
     b=p.stdout.read(size)
@@ -52,14 +55,23 @@ class ClockGuard:
     im=Image.frombytes('L',(640,360),b);present,sig,score=self.inspect(im);count+=1
     if not present:
      missing+=1;dropouts+=1;max_missing=max(max_missing,missing)
-     if self.unverified_flat_frame(im) or missing>20:first_bad=count;break
+     if self.unverified_flat_frame(im):
+      flat_samples+=1
+      if flat_gap_start is None:flat_gap_start=count
+     if flat_gap_start is not None and (
+      not clear or missing>MAX_FLAT_GAP_SAMPLES or flat_samples>MAX_FLAT_GAP_SAMPLES
+     ):
+      first_bad=flat_gap_start
+      break
+     if missing>20:first_bad=count;break
     else:
-     clear+=1;missing=0
+     clear+=1;missing=0;flat_gap_start=None
      if self.changed(old,sig):changes+=1;old=sig
   finally:
    if first_bad:p.terminate()
    try:rc=p.wait(timeout=10)
    except subprocess.TimeoutExpired:p.kill();p.wait();rc=-1
+  if first_bad is None:first_bad=flat_gap_start
   result={'version':VERSION,'frames':count,'clock_changes':changes,'first_bad_frame':first_bad,'osd_dropout_frames':dropouts,'max_osd_dropout_frames':max_missing,'valid':first_bad is None and count>=min_frames and clear>=count*2/3 and changes>=min(10,max(2,count//10)) and rc==0}
   if not result['valid']:raise ValueError(json.dumps(result))
   return result
