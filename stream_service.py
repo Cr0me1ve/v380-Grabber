@@ -1,16 +1,30 @@
 #!/usr/bin/env python3
 """Expose decoded camera frames to the existing redundant NVR selector."""
-import argparse,collections,http.server,json,logging,os,signal,subprocess,threading,time,uuid
+import argparse,collections,http.server,json,logging,os,random,signal,socket,subprocess,threading,time,uuid
 from pathlib import Path
 from direct_client import Client
 LOG=logging.getLogger('v380-source')
+
+def detect_replica_index():
+ try:address=socket.gethostbyname(socket.gethostname())
+ except OSError:return 1
+ for index in range(1,5):
+  try:
+   if socket.gethostbyname('v380-grabber-receiver-'+str(index))==address:return index
+  except OSError:continue
+ return 1
+
 class Source:
- def __init__(self,credentials,quality):
+ def __init__(self,credentials,quality,replica_index=1):
   self.credentials=credentials;self.config=json.loads(Path(credentials).read_text());self.quality=quality;self.lock=threading.Condition();self.boot=uuid.uuid4().hex;self.epoch=0;self.seq=0;self.jpeg=None;self.frame_at=0.;self.camera_at=0.;self.camera_stamp=None;self.camera_ticks=0;self.live_at=0.;self.connected=False;self.reason='starting';self.stop=threading.Event();self.times=collections.deque(maxlen=90);self.attrs={};self.decoder=None;self.client=None;self.decoder_at=0.
+  self.replica_index=replica_index;self.attempt_at=time.monotonic()
  def status(self):
   now=time.monotonic();healthy=self.connected and self.jpeg is not None and now-self.frame_at<2 and now-self.camera_at<2
   fps=(len(self.times)-1)/(self.times[-1]-self.times[0]) if len(self.times)>1 else 0
-  return {'healthy':bool(healthy),'fps':round(fps,2),'age':round(now-self.camera_at,2) if self.camera_at else 999999,'generation':self.boot+':'+str(self.epoch),'reason':'ok' if healthy else self.reason if not self.connected else 'decoder or camera frames stalled','timestamp_present':bool(healthy),'clock_ticks':self.camera_ticks,'clock_match_score':0,'window_valid':bool(healthy),'healthy_for':round(now-self.live_at,2) if healthy and self.live_at else 0,'transport':'authenticated V380 Neo TCP','timestamp_source':'camera media header','width':640,'height':360,'camera_attributes':self.attrs}
+  client=self.client
+  return {'healthy':bool(healthy),'fps':round(fps,2),'age':round(now-self.camera_at,2) if self.camera_at else 999999,'generation':self.boot+':'+str(self.epoch),'reason':'ok' if healthy else self.reason if not self.connected else 'decoder or camera frames stalled','timestamp_present':bool(healthy),'clock_ticks':self.camera_ticks,'clock_match_score':0,'window_valid':bool(healthy),'healthy_for':round(now-self.live_at,2) if healthy and self.live_at else 0,'transport':'authenticated V380 Neo TCP','timestamp_source':'camera media header','width':640,'height':360,'camera_attributes':self.attrs,
+          'replica_index':self.replica_index,'connection_phase':client.phase if client else 'retry wait',
+          'attempt_age':round(now-self.attempt_at,2),'media_peer':client.media_host if client else None}
  def invalidate(self,reason):
   with self.lock:
    if self.connected or self.jpeg is not None:self.epoch+=1
@@ -42,8 +56,9 @@ class Source:
   backoff=1
   while not self.stop.is_set():
    proc=None;reader=None;client=None;dead=threading.Event();beg=time.monotonic()
+   self.attempt_at=beg
    try:
-    client=Client(self.config);self.client=client;client.start(self.quality)
+    client=Client(self.config,self.replica_index);self.client=client;client.start(self.quality)
     ff='/usr/bin/ffmpeg'
     if not Path(ff).exists():raise RuntimeError('FFmpeg is not installed at /usr/bin/ffmpeg')
     env=os.environ.copy()
@@ -67,7 +82,8 @@ class Source:
     if not self.stop.is_set():raise RuntimeError('Decoder stream ended')
    except Exception as e:
     if client:client.mark_failure()
-    LOG.warning('Camera connection interrupted: %s %s',type(e).__name__,str(e)[:120]);self.invalidate('camera connection interrupted')
+    phase=client.phase if client else 'startup'
+    LOG.warning('Camera connection interrupted during %s: %s %s',phase,type(e).__name__,str(e)[:120]);self.invalidate('camera connection interrupted')
    finally:
     if client:client.close()
     self.client=None
@@ -81,7 +97,7 @@ class Source:
     if reader:reader.join(timeout=3)
     self.decoder=None
    if time.monotonic()-beg>30:backoff=1
-   self.stop.wait(backoff);backoff=min(backoff*2,15)
+   self.stop.wait(backoff+random.uniform(0,.6));backoff=min(backoff*2,5)
 class Handler(http.server.BaseHTTPRequestHandler):
  def setup(self):
   super().setup();self.connection.settimeout(5)
@@ -106,7 +122,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
     self.wfile.write(b'--frame\r\nContent-Type: image/jpeg\r\nContent-Length: '+str(len(frame)).encode()+b'\r\n\r\n'+frame+b'\r\n');self.wfile.flush()
   except (BrokenPipeError,ConnectionResetError):pass
 if __name__=='__main__':
- p=argparse.ArgumentParser();p.add_argument('--credentials',required=True);p.add_argument('--quality',type=int,default=1);p.add_argument('--port',type=int,default=8081);a=p.parse_args();logging.basicConfig(level=logging.INFO,format='%(asctime)s %(levelname)s %(message)s');source=Source(a.credentials,a.quality)
+ p=argparse.ArgumentParser();p.add_argument('--credentials',required=True);p.add_argument('--quality',type=int,default=1);p.add_argument('--port',type=int,default=8081);p.add_argument('--replica-index',type=int,choices=range(1,5));a=p.parse_args();logging.basicConfig(level=logging.INFO,format='%(asctime)s %(levelname)s %(message)s');source=Source(a.credentials,a.quality,a.replica_index or detect_replica_index())
+ LOG.info('Receiver slot %s started',source.replica_index)
  server=http.server.ThreadingHTTPServer(('0.0.0.0',a.port),Handler);server.source=source
  worker=threading.Thread(target=source.run,daemon=True);worker.start()
  def shutdown(signum,frame):

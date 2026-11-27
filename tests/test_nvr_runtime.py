@@ -163,6 +163,51 @@ class DurableMotionQueueTests(unittest.TestCase):
 
 
 class StartupRecoveryTests(unittest.TestCase):
+    def test_motioneye_does_not_inherit_the_previous_cloud_outage_timer(self):
+        state = {"outage_since": 9_800}
+        runtime = SimpleNamespace(data=Path(tempfile.gettempdir()) / "v380-synthetic-watchdog-test")
+        down = {"camera": False, "source_service_failed": False}
+        warming = {"camera": True, "motion": False}
+        with (
+            patch.object(nvr_worker, "RUNTIME", runtime),
+            patch.object(nvr_worker, "RECOVERED", {}),
+            patch.object(nvr_worker.time, "time", return_value=10_000) as clock,
+            patch.object(nvr_worker.subprocess, "run", return_value=SimpleNamespace(returncode=0)) as run,
+        ):
+            nvr_worker.recover(down, state)
+            nvr_worker.recover(warming, state)
+            clock.return_value += 20
+            nvr_worker.recover(warming, state)
+            run.assert_not_called()
+            clock.return_value += 26
+            nvr_worker.recover(warming, state)
+            self.assertEqual(run.call_args.args[0], ["docker", "restart", "v380-grabber-motioneye-1"])
+
+    def test_watchdog_leaves_a_retrying_receiver_running_but_recovers_a_stalled_one(self):
+        runtime = SimpleNamespace(
+            data=Path(tempfile.gettempdir()) / "v380-synthetic-watchdog-test",
+            settings=lambda: {"receivers": 2},
+        )
+        diagnostics = {"source_state": {"backends": [
+            {"name": "receiver1", "health_reachable": True, "attempt_age": 3},
+            {"name": "receiver2", "health_reachable": False},
+        ]}}
+        with (
+            patch.object(nvr_worker, "RUNTIME", runtime),
+            patch.object(nvr_worker, "RECOVERED", {}),
+            patch.object(nvr_worker, "REPLICA_BAD", {}),
+            patch.object(nvr_worker, "REPLICA_GENERATION", {}),
+            patch.object(nvr_worker, "REPLICA_LAST", 0),
+            patch.object(nvr_worker.time, "time", return_value=10_000) as clock,
+            patch.object(nvr_worker, "inspect_container", return_value=(True, None)),
+            patch.object(nvr_worker.subprocess, "run") as run,
+        ):
+            nvr_worker.recover_replicas(diagnostics)
+            clock.return_value += 100
+            nvr_worker.recover_replicas(diagnostics)
+            run.assert_called_once()
+            self.assertEqual(run.call_args.args[0], ["docker", "restart", "v380-grabber-receiver-2"])
+
     def test_bot_stays_up_and_starts_watchdog_when_docker_is_down(self):
         watchdog_started = threading.Event()
         handlers = {}

@@ -223,10 +223,19 @@ def cached_probe():
  return d if time.time()-d.get('checked',0)<8 else probe()
 def recover(d,state):
  if (RUNTIME.data/'maintenance').exists():return
- component='v380-grabber-motioneye-1' if d.get('camera') else ('v380-grabber-selector-1' if d.get('source_service_failed') else 'v380-grabber-receiver-1')
- since=state.get('outage_since',time.time());delay=45 if d.get('camera') else 90
- if time.time()-since<delay or time.time()-RECOVERED.get(component,0)<300:return
- RECOVERED[component]=time.time();log('Host watchdog recovering '+component)
+ if d.get('camera') and not d.get('motion'):
+  component='v380-grabber-motioneye-1';delay=45
+ elif not d.get('camera') and d.get('source_service_failed'):
+  component='v380-grabber-selector-1';delay=90
+ else:
+  state.pop('recovery_component',None);state.pop('recovery_since',None)
+  return
+ now=time.time()
+ # A recorder warming up after a cloud outage gets its own recovery window.
+ if state.get('recovery_component')!=component:
+  state.update(recovery_component=component,recovery_since=now)
+ if now-state.get('recovery_since',now)<delay or now-RECOVERED.get(component,0)<300:return
+ RECOVERED[component]=now;log('Host watchdog recovering '+component)
  daemon=subprocess.run(['systemctl','is-active','--quiet','docker.service']).returncode==0
  if not daemon:subprocess.run(['systemctl','start','docker.service'],capture_output=True,timeout=45)
  else:subprocess.run(['docker','restart',component],capture_output=True,timeout=45)
@@ -237,15 +246,21 @@ def recover_replicas(d):
  global REPLICA_LAST
  now=time.time()
  if now-REPLICA_LAST<20 or (RUNTIME.data/'maintenance').exists():return
- REPLICA_LAST=now
  states={x['name']:x for x in d.get('source_state',{}).get('backends',[])}
+ if not states:return
+ REPLICA_LAST=now
  for index in range(1,RUNTIME.settings()['receivers']+1):
   key='receiver'+str(index);name='v380-grabber-receiver-'+str(index)
   try:
    running,_=inspect_container(name)
-   if states.get(key,{}).get('eligible'):
+   backend=states.get(key,{})
+   attempt=backend.get('attempt_age')
+   # A responsive receiver making progress through retries can recover in place.
+   reconnecting=(backend.get('health_reachable') and not backend.get('source_healthy')
+                 and isinstance(attempt,(float,int)) and attempt<120)
+   if running and (backend.get('eligible') or reconnecting):
     REPLICA_BAD.pop(name,None);continue
-   generation=states.get(key,{}).get('generation')
+   generation=backend.get('generation')
    if generation and REPLICA_GENERATION.get(name)!=generation:
     REPLICA_GENERATION[name]=generation;REPLICA_BAD[name]=now
    since=REPLICA_BAD.setdefault(name,now)
@@ -321,8 +336,9 @@ def monitor_loop():
    connection_diagnostics(d)
    with CACHE_LOCK:MONITOR_CACHE=d
    healthy=d.get('camera') and d.get('motion');now=time.time()
+   recover_replicas(d)
+   recover(d,state)
    if healthy:
-    recover_replicas(d)
     stable+=1
     if stable>=2:
      if state.get('announced') and RUNTIME.settings()['outage_alerts']:
@@ -334,7 +350,6 @@ def monitor_loop():
     if now-state['outage_since']>=15 and not state.get('announced') and RUNTIME.settings()['outage_alerts']:
      enqueue_message('❌ Camera video was interrupted. '+d['reason']+'. Automatic recovery is running.')
      state['announced']=True
-    recover(d,state)
    save(STATUS_FILE,state)
   except Exception as e:log('Monitor retry: '+type(e).__name__)
   STOP.wait(5)

@@ -93,9 +93,20 @@ def select():
  READY=ok
  return chosen,now
 
+def backend_status(backend, now):
+ h=backend['health'];caught_up=eligible(backend,now);reachable=bool(backend['health_at'] and now-backend['health_at']<3)
+ return {'name':backend['name'],'eligible':caught_up,'healthy':caught_up,
+         'source_healthy':bool(h.get('healthy')),'health_reachable':reachable,
+         'reason':h.get('reason',backend['error']),
+         'clock_age':round(h.get('age',0)+now-backend['health_at'],2) if backend['health_at'] else None,
+         'frame_age':round(now-backend['frame_at'],2) if backend['frame_at'] else None,
+         'generation':backend['generation'],'media_peer':h.get('media_peer') if reachable else None,
+         'connection_phase':h.get('connection_phase') if reachable else None,
+         'attempt_age':h.get('attempt_age') if reachable else None}
+
 def status():
  b,now=select();h=b['health'] if b else {};age=min(6,max(0,h.get('age',0)+now-b['health_at'])) if b and now-b['health_at']<3 else (now-b['frame_at'] if b else 999999)
- return {'healthy':READY,'fps':15,'age':round(age,2),'generation':BOOT+':'+str(EPOCH),'reason':'ok' if READY else 'all camera sources unavailable','timestamp_present':READY,'clock_ticks':h.get('clock_ticks',b['ticks']) if b else 0,'clock_match_score':h.get('clock_match_score',0),'window_valid':READY,'healthy_for':round(now-LIVE_AT,2) if READY else 0,'active_source':SELECTED if READY else None,'switches':SWITCHES,'buffer_seconds':round(RING[-1][2]-RING[0][2],2) if len(RING)>1 else 0,'buffer_frames':len(RING),'buffer_bytes':RING_BYTES,'backends':[{'name':x['name'],'eligible':eligible(x,now),'healthy':eligible(x,now),'source_healthy':bool(x['health'].get('healthy')),'reason':x['health'].get('reason',x['error']),'clock_age':round(x['health'].get('age',0)+now-x['health_at'],2) if x['health_at'] else None,'frame_age':round(now-x['frame_at'],2) if x['frame_at'] else None,'generation':x['generation']} for x in BACKENDS if enabled(x)]}
+ return {'healthy':READY,'fps':15,'age':round(age,2),'generation':BOOT+':'+str(EPOCH),'reason':'ok' if READY else 'all camera sources unavailable','timestamp_present':READY,'clock_ticks':h.get('clock_ticks',b['ticks']) if b else 0,'clock_match_score':h.get('clock_match_score',0),'window_valid':READY,'healthy_for':round(now-LIVE_AT,2) if READY else 0,'active_source':SELECTED if READY else None,'switches':SWITCHES,'buffer_seconds':round(RING[-1][2]-RING[0][2],2) if len(RING)>1 else 0,'buffer_frames':len(RING),'buffer_bytes':RING_BYTES,'backends':[backend_status(x,now) for x in BACKENDS if enabled(x)]}
 
 def publish_loop():
  global SEQ,RING_BYTES

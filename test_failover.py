@@ -30,14 +30,20 @@ class FailoverTests(unittest.TestCase):
    def close(self):pass
   with patch('direct_client.http.client.HTTPConnection',Connection):c.refresh_relays()
   self.assertEqual(hosts,['preferred.invalid','dispatch.av380.net']);self.assertEqual(c.c['relays'],[cached,fresh])
- def test_relay_failure_tries_backup_and_prefers_winner(self):
+ def test_relay_failure_tries_backup_and_cools_failed_address(self):
   first={'ip':'192.0.2.1'};second={'ip':'192.0.2.2'};c=Client({'relays':[first,second]});attempts=[]
   c.authorize=lambda:None;c.refresh_relays=lambda:None;c.rpc=lambda *a:None
   def connect(relay):
    attempts.append(relay)
    if relay==first:raise OSError('connection reset')
   c.connect=connect;c.start()
-  self.assertEqual(attempts,[first,second]);self.assertEqual(c.c['relays'][0],second)
+  self.assertEqual(attempts,[first,second])
+  self.assertEqual(c.relay_candidates(),[second,first])
+ def test_replicas_prefer_different_relays_from_the_same_pool(self):
+  relays=[{'ip':f'192.0.2.{i}'} for i in range(1,4)]
+  config={'relays':relays}
+  self.assertEqual([Client(config,i).relay_candidates()[0] for i in range(1,5)],
+                   [*relays,relays[0]])
  def test_http_redirect_does_not_prevent_controller_fallback(self):
   peer=X25519PrivateKey.generate().public_key().public_bytes(Encoding.Raw,PublicFormat.Raw)
   c=Client({'device_public_key':base64.b64encode(peer).decode(),'token':'0'*64,'device_id':1,'secret_ip':'192.0.2.1','secret_ips':['192.0.2.2'],'secret_host':'example.invalid','secret_path':'/exch'})

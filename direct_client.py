@@ -45,7 +45,9 @@ def decode_media(body,key):
  return {'kind':h[0],'codec':codec,'frame_id':struct.unpack_from('<I',h,2)[0],'timestamp_ms':struct.unpack_from('<Q',h,10)[0],'payload':bytes(media[:size])}
 
 class Client:
- def __init__(self,config):self.c=config;self.sock=None;self.key=None;self.sid=None;self.counter=secrets.randbelow(256);self.active_relay=None
+ def __init__(self,config,replica_index=1):
+  self.c=config;self.replica_index=replica_index;self.sock=None;self.key=None;self.sid=None
+  self.counter=secrets.randbelow(256);self.active_relay=None;self.media_host=None;self.phase='controller'
  def post(self,host,port,path,obj,host_header=None):
   raw=compact(obj);stamp=str(obj['timestamp']).encode();first=hashlib.md5(raw+stamp).hexdigest()
   signature=hashlib.md5((first+self.c['signature_suffix']).encode()).hexdigest()
@@ -76,13 +78,15 @@ class Client:
     answer=candidate.get('tr') or {};code=answer.get('result',{}).get('code')
     if code!=1000:
      camera_code=code
-     LOG.warning('Controller could not authorize camera: code %s',code);continue
+     LOG.warning('Controller %s could not authorize camera: code %s',host,code);continue
     if answer.get('data',{}).get('secure')!=2:raise RuntimeError('Unsupported camera encryption mode')
     result=candidate;tr=answer;self.c['secret_ip']=host;break
    except CloudAPIError as e:
     if e.code not in [1012,1005,1006]:raise
-    LOG.info('Controller unavailable; trying another address')
-   except (OSError,http.client.HTTPException,CloudHTTPError,ValueError):LOG.info('Controller network or HTTP error; trying another address')
+    LOG.info('Controller %s unavailable: %s; trying another address',host,e)
+   except (OSError,http.client.HTTPException,CloudHTTPError,ValueError) as e:
+    detail=str(e) if isinstance(e,CloudHTTPError) else type(e).__name__
+    LOG.info('Controller %s request failed: %s; trying another address',host,detail)
   if result is None:
    if camera_code is not None:raise CameraAPIError(camera_code)
    raise RuntimeError('No controller could reach this camera')
@@ -94,9 +98,12 @@ class Client:
    now=time.monotonic()
    if now<self.c.get('_key_refresh_after',0):raise
    self.c['_key_refresh_after']=now+30
-   from account_auth import refresh_public_key
+   from account_auth import AccountError,refresh_public_key
    LOG.info('Refreshing camera public key through the cloud API')
-   self.c['device_public_key']=refresh_public_key(self.c['token'],self.c['device_id'])
+   try:self.c['device_public_key']=refresh_public_key(self.c['token'],self.c['device_id'])
+   except AccountError:
+    self.c['_key_refresh_after']=time.monotonic()+8
+    raise
    self._authorize_once()
  def refresh_relays(self):
   stamp=int(time.time());platform=self.c.get('dispatch_platform',20000)
@@ -132,7 +139,9 @@ class Client:
   hello=bytearray(1500);struct.pack_into('<III',hello,0,1100,self.c['device_id'],int(channel['channel_handle']));self.sock.sendall(hello);reply=exact(self.sock,64)
   cmd,code=struct.unpack_from('<II',reply)
   if cmd!=1101 or code!=1000:raise RuntimeError('Relay channel code '+str(code))
-  self.active_relay=relay;LOG.info('Cloud video transport connected via relay %s',relay['ip'])
+  self.active_relay=relay
+  self.media_host=self.sock.getpeername()[0]
+  LOG.info('Cloud video transport connected via relay %s, media peer %s',relay['ip'],self.media_host)
  def rpc(self,method,params):
   obj={'id':secrets.randbits(32),'chn':0,'method_id':method,'ts':int(time.time()),'params':params};body=encrypt(compact(obj),self.key);self.counter=(self.counter+1)&255
   magic=0x00030990 if method==199056 else 0x38030818
@@ -152,22 +161,33 @@ class Client:
    finally:self.sock=None
  def mark_failure(self):
   if not self.active_relay:return
-  identity=self.active_relay['ip']+':'+str(self.active_relay.get('tp',{}).get('call_port',80))
-  self.c.setdefault('_relay_cooldowns',{})[identity]=time.monotonic()+60
+  self.cool_down_relay(self.active_relay)
   LOG.info('Transport failed; temporarily preferring alternate relays')
+ def cool_down_relay(self,relay):
+  identity=relay['ip']+':'+str(relay.get('tp',{}).get('call_port',80))
+  self.c.setdefault('_relay_cooldowns',{})[identity]=time.monotonic()+60
  def relay_candidates(self):
+  relays=self.c['relays']
+  if not relays:return []
+  offset=(self.replica_index-1)%len(relays)
+  # Keep the dispatch order stable so replicas keep separate first choices.
+  choices=relays[offset:]+relays[:offset]
   cooldowns=self.c.get('_relay_cooldowns',{});now=time.monotonic()
   def rank(relay):
    identity=relay['ip']+':'+str(relay.get('tp',{}).get('call_port',80));until=cooldowns.get(identity,0)
    return (until>now,until if until>now else 0)
-  return sorted(self.c['relays'],key=rank)
+  return sorted(choices,key=rank)
  def start(self,quality=1):
-  self.authorize();self.refresh_relays();errors=[]
+  self.authorize();self.phase='relay discovery';self.refresh_relays()
+  self.phase='relay'
   for relay in self.relay_candidates():
    try:
-    self.connect(relay);self.c['relays']=[relay]+[x for x in self.c['relays'] if x!=relay];break
-   except (OSError,RuntimeError,ValueError) as e:self.close();errors.append(type(e).__name__);LOG.warning('Relay attempt failed: %s; trying next address',type(e).__name__)
+    self.connect(relay);break
+   except (OSError,RuntimeError,ValueError) as e:
+    self.close();self.cool_down_relay(relay)
+    LOG.warning('Relay %s attempt failed: %s; trying next address',relay['ip'],type(e).__name__)
   else:raise RuntimeError('No cloud video relay available')
+  self.phase='video'
   self.rpc(197122,{'up':{'quality':quality,'video':1,'audio':0,'vsspec':0},'down':{'vattr':{'codec':0,'width':0,'height':0},'aattr':{'codec':0,'samplerate':0,'bits':0,'chns':0}}})
  def capture(self,path,seconds,quality):
   self.start(quality)
