@@ -28,15 +28,15 @@ class NvrRuntime:
  def apply_settings(self):
   settings=self.settings();cfg.write_runtime_settings(settings)
   path=self.data/'motioneye/camera-1.conf'
-  updates={'pre_capture':str(int(settings['pre_roll'])*15),'threshold':str({'low':9216,'medium':4608,'high':2304}[settings['sensitivity']]),'# @motion_detection':'true' if settings['enabled'] else 'false','# @preserve_movies':str(settings['retention_days'])}
+  updates={'pre_capture':str(int(settings['pre_roll'])*15),'movie_max_time':str(settings['duration']),'threshold':str({'low':9216,'medium':4608,'high':2304}[settings['sensitivity']]),'# @motion_detection':'true' if settings['enabled'] else 'false','# @preserve_movies':str(settings['retention_days'])}
   text=path.read_text();lines=text.splitlines()
   for key,value in updates.items():
    lines=[line for line in lines if not (line==key or line.startswith(key+' '))];lines.append(key+' '+value)
   cfg.atomic(path,('\n'.join(lines)+'\n').encode())
   if os.geteuid()==0:os.chown(path,1000,1000)
   try:
-   self.control('config/set?'+urllib.parse.urlencode({'threshold':updates['threshold']}))
-   self.control('config/set?'+urllib.parse.urlencode({'pre_capture':updates['pre_capture']}))
+   for key in ('threshold','pre_capture','movie_max_time'):
+    self.control('config/set?'+urllib.parse.urlencode({key:updates[key]}))
    self.control('detection/start' if settings['enabled'] else 'detection/pause')
   except Exception:pass  # A starting MotionEye reads the persisted configuration.
  def set_setting(self,name,value):

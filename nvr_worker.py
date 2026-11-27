@@ -3,6 +3,7 @@
 import datetime,json,os,subprocess,time,urllib.request,urllib.error,uuid,threading,signal,shutil,math
 from pathlib import Path
 from zoneinfo import ZoneInfo
+from runtime.queue_movie import MOVIE_PATH
 SPOOL=STATE=MESSAGES=STATUS_FILE=None
 RUNTIME=None
 C={}
@@ -56,6 +57,35 @@ def validate_media(job):
  r=subprocess.run(['docker','exec','v380-grabber-motioneye-1','python3','/helpers/scene_guard.py',inside]+minimum,capture_output=True,text=True,timeout=max(20,int(job.get('duration',30)*.5)))
  if r.returncode==3:raise EmptyFootage('Empty black camera scene')
  if r.returncode:raise RuntimeError('Scene validation failed')
+
+def export_movie(job, relative, offset=0):
+ inside='/var/lib/motioneye/'+RUNTIME.settings()['archive_subdir']+'/'+relative
+ seconds=job.get('requested_duration',30)
+ r=subprocess.run(['docker','exec','v380-grabber-motioneye-1','python3','/helpers/recover_archive.py',
+                   job['id'],inside,str(seconds),str(offset)],capture_output=True,text=True,timeout=max(45,seconds+15))
+ if r.returncode==3:raise EmptyFootage('Empty archived scene')
+ if r.returncode==4:return None
+ if r.returncode:raise RuntimeError('Archive export helper failed: '+r.stderr.strip().split('\n')[-1][:160])
+ return json.loads(r.stdout)
+
+def capture_closed_movie(job, video):
+ relative=job['archive_source']
+ if not isinstance(relative,str) or not MOVIE_PATH.fullmatch(relative):raise ValueError('Malformed archive source')
+ if not video.exists() and shutil.disk_usage(SPOOL).free<float(RUNTIME.settings()['reserve_gb'])*1024**3+20*1024**2:
+  raise RuntimeError('Disk reserve reached')
+ root=RUNTIME.data/'recordings'/RUNTIME.settings()['archive_subdir']
+ result=export_movie(job,relative,job['archive_offset']) if (root/relative).is_file() else None
+ if result:
+  job.update(duration=result['duration'],captured=True,archive=relative)
+  log('Prepared motion movie clip '+job['id'])
+ else:
+  job.update(done=True,failed=True,skipped='no validated recording available')
+  notify_failed_capture(job)
+
+def notify_failed_capture(job):
+ moment=datetime.datetime.fromtimestamp(job['created'],ZoneInfo(RUNTIME.settings()['timezone'])).strftime('%H:%M:%S')
+ enqueue_message('Could not save the camera event at '+moment+'. No valid footage was found in the archive.')
+
 def recover_archive(job):
  root=RUNTIME.data/'recordings'/RUNTIME.settings()['archive_subdir']
  moment=datetime.datetime.fromtimestamp(job['created'],ZoneInfo(RUNTIME.settings()['timezone']))
@@ -73,12 +103,10 @@ def recover_archive(job):
   code="from pathlib import Path;import os,sys;opened=False;\nfor p in Path('/proc').glob('[0-9]*/fd/*'):\n try:\n  if os.readlink(p)==sys.argv[1]:opened=True;break\n except OSError:pass\nprint('OPEN' if opened else 'CLOSED')"
   r=subprocess.run(['docker','exec','v380-grabber-motioneye-1','python3','-c',code,inside],capture_output=True,text=True,timeout=6)
   if r.returncode or r.stdout.strip()!='CLOSED':continue
-  r=subprocess.run(['docker','exec','v380-grabber-motioneye-1','python3','/helpers/recover_archive.py',job['id'],inside,str(job.get('requested_duration',30))],capture_output=True,text=True,timeout=max(45,job.get('requested_duration',30)+15))
-  if r.returncode==3:raise EmptyFootage('Empty archived scene')
-  if r.returncode==4:
+  result=export_movie(job,relative)
+  if result is None:
    job['archive_rejected']={'path':relative,'mtime':archive.stat().st_mtime};continue
-  if r.returncode:raise RuntimeError('Archive recovery helper failed')
-  return json.loads(r.stdout)
+  return result
  return None
 
 def capture_error(e):
@@ -99,13 +127,15 @@ def process(p,stage):
   job.update(done=True,failed=True);save(p,job);return
  if now<job.get('next_try',0):return
  if not job.get('captured'):
+  if 'archive_source' in job:
+   capture_closed_movie(job,video);save(p,job);return
   if job.get('archive_pending') or now-job['created']>90:
    job['archive_pending']=True;result=recover_archive(job)
    if result:
     job.update(duration=result['duration'],captured=True,recovered=bool(result.get('recovered_from_archive')),archive=result.get('recovered_from_archive'));save(p,job);log('Recovered archived motion clip '+job['id']);return
    if now-job['created']>600:
     job.update(done=True,failed=True,skipped='no validated recording available')
-    enqueue_message('Could not save the camera event at '+datetime.datetime.fromtimestamp(job['created'],ZoneInfo(RUNTIME.settings()['timezone'])).strftime('%H:%M:%S')+'. No valid footage was found in the archive.')
+    notify_failed_capture(job)
    else:job['next_try']=now+5
    save(p,job);return
   if (SPOOL/(job['id']+'.complete')).exists() and video.exists():
@@ -135,9 +165,13 @@ def clean():
     for f in SPOOL.glob(d['id']+'.*'):f.unlink(missing_ok=True)
   except (OSError,ValueError):pass
 STOP=threading.Event()
+def job_order(path):
+ value=safe_json(path,{}).get('created')
+ return value if isinstance(value,(int,float)) and math.isfinite(value) else 0
+
 def work(stage):
  while not STOP.is_set():
-  for p in sorted(SPOOL.glob('*.json')):
+  for p in sorted(SPOOL.glob('*.json'),key=job_order):
    if p.stem=='settings':continue
    if STOP.is_set():break
    try:process(p,stage)
